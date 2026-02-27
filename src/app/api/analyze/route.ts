@@ -1,5 +1,4 @@
 import { AnalyzerEngine } from "@/lib/analyzer/engine";
-import { simpleGit } from "simple-git";
 import { dir } from "tmp-promise";
 import AdmZip from "adm-zip";
 import { supabase } from "@/lib/supabase";
@@ -79,38 +78,67 @@ export async function POST(request: Request) {
             message: "Extraction complete. Starting analysis...",
           });
         } else if (repoUrl) {
-          send({
-            type: "progress",
-            pct: 5,
-            message: "Creating temp workspace...",
-          });
+          send({ type: "progress", pct: 5, message: "Parsing repository URL..." });
           tempDir = await dir({ unsafeCleanup: true });
           targetPath = tempDir.path;
 
-          let cloneUrl = repoUrl;
-          if (token) {
-            const urlObj = new URL(repoUrl);
-            urlObj.username = token;
-            cloneUrl = urlObj.toString();
+          // Parse GitHub URL → owner/repo + optional branch
+          // Supports: https://github.com/owner/repo  or  https://github.com/owner/repo/tree/branch
+          const ghMatch = repoUrl
+            .replace(/\.git$/, "")
+            .match(/github\.com\/([^\/]+)\/([^\/]+)(?:\/tree\/([^\/]+))?/);
+
+          if (!ghMatch) {
+            throw new Error(
+              "Only GitHub URLs are supported (e.g. https://github.com/owner/repo)"
+            );
           }
 
-          send({
-            type: "progress",
-            pct: 10,
-            message: "Cloning repository (this may take a moment)...",
-          });
-          const git = simpleGit();
-          await git.clone(cloneUrl, targetPath, ["--depth", "1"]);
+          const owner = ghMatch[1];
+          const repo  = ghMatch[2];
+          const branch = ghMatch[3] || "HEAD";
 
-          // Resolve real (long) path — fixes Windows 8.3 short paths (e.g. DEVELO~1)
-          // which break glob patterns used by ts-morph
-          const { realpath } = await import("fs/promises");
-          targetPath = await realpath(targetPath);
-          send({
-            type: "progress",
-            pct: 30,
-            message: "Clone complete. Starting analysis...",
-          });
+          // GitHub ZIP download endpoint — no git binary required
+          const zipUrl = `https://github.com/${owner}/${repo}/archive/refs/heads/${branch === "HEAD" ? "main" : branch}.zip`;
+          const fallbackZipUrl = `https://github.com/${owner}/${repo}/archive/${branch}.zip`;
+
+          send({ type: "progress", pct: 10, message: `Downloading ${owner}/${repo}@${branch}...` });
+
+          const headers: Record<string, string> = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "Hunttdown/1.0",
+          };
+          if (token) headers["Authorization"] = `Bearer ${token}`;
+
+          // Try primary branch URL, fall back to /archive/{branch}.zip
+          let dlRes = await fetch(zipUrl, { headers });
+          if (!dlRes.ok) {
+            dlRes = await fetch(fallbackZipUrl, { headers });
+          }
+          if (!dlRes.ok) {
+            throw new Error(
+              `Failed to download repository (HTTP ${dlRes.status}). ` +
+              `Check the URL is correct and the repo is public (or provide a PAT token for private repos).`
+            );
+          }
+
+          send({ type: "progress", pct: 20, message: "Extracting repository archive..." });
+
+          const arrayBuffer = await dlRes.arrayBuffer();
+          const zipBuffer  = Buffer.from(arrayBuffer);
+          const zip = new AdmZip(zipBuffer);
+          zip.extractAllTo(targetPath, true);
+
+          // GitHub ZIP contains a single top-level folder e.g. "repo-main/"
+          // Move into it so ts-morph finds source files at the root
+          const { readdir, realpath: fsRealpath } = await import("fs/promises");
+          const entries = await readdir(targetPath);
+          if (entries.length === 1) {
+            targetPath = `${targetPath}/${entries[0]}`;
+          }
+          targetPath = await fsRealpath(targetPath);
+
+          send({ type: "progress", pct: 30, message: "Archive extracted. Starting analysis..." });
         }
 
         send({
