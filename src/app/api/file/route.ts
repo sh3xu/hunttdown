@@ -14,10 +14,12 @@ export async function GET(request: Request) {
   }
 
   try {
-    const fullPath = path.resolve(root, filePath);
+    const rootPath = path.resolve(root);
+    const fullPath = path.resolve(rootPath, filePath);
+    const relative = path.relative(rootPath, fullPath);
 
     // Security check
-    if (!fullPath.startsWith(path.resolve(root))) {
+    if (relative.startsWith("..") || path.isAbsolute(relative)) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
 
